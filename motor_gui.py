@@ -509,9 +509,9 @@ class App(tk.Tk):
         vals = []
         mask = 0
         for i, cmd in enumerate(cmds):
-            base = 180.0
             if cmd.enabled:
-                v = base + cmd.amplitude_deg * math.sin(2 * math.pi * cmd.frequency_hz * t)
+                # Run sine motion around the configured target position.
+                v = cmd.target_deg + cmd.amplitude_deg * math.sin(2 * math.pi * cmd.frequency_hz * t)
                 mask |= (1 << i)
             else:
                 v = cmd.target_deg
