@@ -1,0 +1,16 @@
+directories:
+  output: dist
+  buildResources: build
+appId: com.example.app
+productName: MyElectronApp
+files:
+  - filter:
+      - dist/**/*
+      - electron/**/*
+win:
+  target: nsis
+mac:
+  target: dmg
+linux:
+  target: AppImage
+electronVersion: 27.1.3

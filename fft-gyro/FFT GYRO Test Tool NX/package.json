@@ -1,0 +1,78 @@
+{
+  "name": "testtool2",
+  "description": "test tool",
+  "private": true,
+  "version": "0.8.0",
+  "main": "electron/main.js",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "electron:dev": "electron .",
+    "linux": "vite & electron .",
+    "electron:build": "vite build && electron-builder",
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make"
+  },
+  "build": {
+    "appId": "com.example.app",
+    "productName": "MyElectronApp",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  },
+  "dependencies": {
+    "@electron/remote": "^2.1.2",
+    "@react-three/drei": "^10.0.4",
+    "@react-three/fiber": "^9.1.0",
+    "chart.js": "^4.4.7",
+    "d3": "^7.9.0",
+    "electron-squirrel-startup": "^1.0.1",
+    "papaparse": "^5.5.2",
+    "plotly.js": "^2.35.3",
+    "react": "^19.0.0",
+    "react-chartjs-2": "^5.3.0",
+    "react-dom": "^19.0.0",
+    "react-plotly.js": "^2.6.0",
+    "serialport": "12.0.0",
+    "three": "^0.174.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.8.0",
+    "@electron-forge/maker-deb": "^7.8.0",
+    "@electron-forge/maker-dmg": "^7.8.0",
+    "@electron-forge/maker-rpm": "^7.8.0",
+    "@electron-forge/maker-squirrel": "^7.8.0",
+    "@electron-forge/maker-zip": "^7.8.0",
+    "@electron-forge/plugin-auto-unpack-natives": "^7.8.0",
+    "@electron-forge/plugin-fuses": "^7.8.0",
+    "@electron/fuses": "^1.8.0",
+    "@types/d3": "^7.4.3",
+    "@types/papaparse": "^5.3.15",
+    "@types/react": "18.2.45",
+    "@types/react-dom": "18.2.18",
+    "@vitejs/plugin-react": "4.2.1",
+    "autoprefixer": "10.4.16",
+    "electron": "27.1.3",
+    "electron-builder": "^26.0.12",
+    "postcss": "8.4.32",
+    "tailwindcss": "3.3.6",
+    "typescript": "5.3.3",
+    "vite": "5.0.10"
+  }
+}
