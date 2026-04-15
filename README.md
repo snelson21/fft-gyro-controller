@@ -4,12 +4,11 @@ GUI controller for FFT Gyro motors.
 
 ## Features
 
-- Control **X, Y, Z** axes independently.
+- Control **X, Y, Z** axes independently in **joint mode**.
 - Configure **sine amplitude** and **frequency** per axis.
-- Run continuous sine-wave motion around origin `(0,0,0)`.
-- Set immediate target position for each axis (or all axes).
-- Read back raw response packets from motors (packets #1 and #2) for protocol debugging.
-- Send commands over serial as 32-byte packets.
+- Send immediate per-axis or all-axis position targets.
+- Configure command speed field (`0..1023`) for packet #2 writes.
+- Read and decode motor feedback using the official packet field layout.
 
 ## Run
 
@@ -25,24 +24,34 @@ This app requires `pyserial`.
 pip install pyserial
 ```
 
-## Protocol implementation notes
+## Protocol implementation basis
 
-`communication_protocol.pdf` defines fixed 32-byte packets:
+This app is implemented from the official code in `fft-gyro/`:
 
-- Byte 0: start byte (`0x7A`)
-- Byte 1: packet number (`0x01`, `0x02`, `0x03`)
-- Byte 31: final byte (`0x7B`)
+- `fft-gyro/FFTGYROTestTool/FFTGyroLibrary.pde`
+- `fft-gyro/MATLAB and Simulink files/sendPacket1ToGyroboard.m`
+- `fft-gyro/MATLAB and Simulink files/sendPacket2ToGyroboard.m`
+- `fft-gyro/MATLAB and Simulink files/getDataFromGyroboard2.m`
 
-The app currently sends:
+Protocol summary used by the app:
 
-- **Write packet #3** on connect to switch motors to **joint mode** and turn them on.
-- **Write packet #1** on connect to enable motor torque.
-- **Write packet #2** for position commands:
-  - Byte 22: position mask (bit 0/1/2 => M1/M2/M3)
-  - Bytes 23..28: M1/M2/M3 target positions as little-endian `uint16` values in the `0..1023` range.
-- **Read packet #1 and #2** when using **Read motor feedback**:
-  - Uses packet number in byte 1, with byte 30 set to `0x01` for read mode.
-  - Displays raw returned packet hex and attempts to decode packet #2 bytes 23..28 as M1/M2/M3 positions.
+- All packets are 32 bytes.
+- Byte 0 is start `0x7A` (`'z'`), byte 31 is end `0x7B` (`'{'`).
+- Byte 1 selects packet type:
+  - `0x01`: torque / limits / data-rate control and motor telemetry stream format.
+  - `0x02`: position/velocity/angle-limit command packet.
+  - `0x03`: motor mode configuration packet.
+- Joint-mode initialization sends:
+  1) packet #3 (`set mode`) with ASCII mode fields (`'1'`, `'2'`),
+  2) packet #1 (`torque enable + torque limits + max torque`).
+- Position control sends packet #2 with:
+  - set-velocity bitmask at byte 15,
+  - per-motor velocity fields bytes 16..21,
+  - set-position bitmask at byte 22,
+  - per-motor position fields bytes 23..28 (little-endian uint16).
+- Motor telemetry parsing follows official offsets from `getDataFromGyroboard2.m`.
 
-If your board uses different field offsets or checksum logic, update only `FFTGyroProtocol` in
-`motor_gui.py`.
+## Important operating note
+
+The official tool maps position as absolute motor angle (`raw = deg / 0.088`) for MX motors,
+not the older centered `-150..+150` mapping. This app follows that official mapping.

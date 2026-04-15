@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
-"""FFT Gyro axis controller GUI.
+"""FFT Gyro motor controller GUI.
 
-This app sends 32-byte packets to the FFT Gyro board and supports:
-- Per-axis sine-wave motion around origin.
-- Per-axis amplitude and frequency settings.
-- Per-axis direct position command.
-
-Protocol notes from communication_protocol.pdf used here:
-- Packets are always 32 bytes.
-- Byte[1] is mode.
-- Write packet type-2 is intended for goal position / velocity style control.
-
-Because the PDF's field-by-field table is image-based in this environment, this implementation keeps
-packet structure centralized in FFTGyroProtocol so offsets can be adjusted easily if needed.
+Protocol implementation is based on the official FFTGyroTestTool (Processing)
+and MATLAB scripts in `fft-gyro/`.
 """
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 import threading
 import time
 import tkinter as tk
@@ -28,62 +18,53 @@ from tkinter import messagebox, ttk
 try:
     import serial
     from serial.tools import list_ports
-except Exception:  # pragma: no cover - runtime dependency
+except Exception:  # pragma: no cover
     serial = None
     list_ports = None
-
 
 AXES = ("X", "Y", "Z")
 DEFAULT_BAUD = 9600
 COMMON_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
 
-MAX_ABS_AMPLITUDE_DEG = 150.0
-MAX_FREQUENCY_HZ = 20.0
-MAX_ABS_POSITION_DEG = 150.0
+DEFAULT_MAX_ANGLE_DEG = 360.0
+DEFAULT_MOTOR_RES_DEG = 0.088  # MX-series used by official tool
+DEFAULT_RAW_MAX = 4095
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+MAX_FREQUENCY_HZ = 20.0
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("fft_gyro_controller")
 
 
 @dataclass
-class AxisState:
-    amplitude_deg: float = 0.0
-    frequency_hz: float = 0.1
-    phase_rad: float = 0.0
-    enabled: bool = False
+class AxisCommand:
+    enabled: bool
+    amplitude_deg: float
+    frequency_hz: float
+    target_deg: float
 
 
 class FFTGyroProtocol:
-    """Packet encoder for 32-byte FFT Gyro write packets.
-
-    Packet format extracted from communication_protocol.pdf:
-    - Byte 0: start byte 0x7A
-    - Byte 1: packet number (0x01, 0x02, or 0x03)
-    - Byte 31: final byte 0x7B
-    """
-
     PACKET_SIZE = 32
     START_BYTE = 0x7A
     END_BYTE = 0x7B
+
     PACKET_WRITE_1 = 0x01
     PACKET_WRITE_2 = 0x02
     PACKET_WRITE_3 = 0x03
-    POSITION_CENTER = 512
-    DEG_PER_POSITION = 300.0 / 1023.0
 
-    @classmethod
-    def _deg_to_position(cls, degrees: float) -> int:
-        motor_degrees = degrees + 150.0
-        pos = int(round(motor_degrees / cls.DEG_PER_POSITION))
-        return max(0, min(1023, pos))
+    def __init__(self, motor_res_deg: float = DEFAULT_MOTOR_RES_DEG, raw_max: int = DEFAULT_RAW_MAX) -> None:
+        self.motor_res_deg = motor_res_deg
+        self.raw_max = raw_max
 
     @staticmethod
     def _set_u16_le(pkt: bytearray, offset: int, value: int) -> None:
         pkt[offset] = value & 0xFF
         pkt[offset + 1] = (value >> 8) & 0xFF
+
+    def _deg_to_raw(self, degrees: float) -> int:
+        raw = int(round(degrees / self.motor_res_deg))
+        return max(0, min(self.raw_max, raw))
 
     def _new_packet(self, packet_number: int) -> bytearray:
         pkt = bytearray(self.PACKET_SIZE)
@@ -92,73 +73,135 @@ class FFTGyroProtocol:
         pkt[31] = self.END_BYTE
         return pkt
 
-    def build_init_packet_set_joint_and_enable(self, axis_mask: int = 0b111, *, use_ascii_fields: bool = True) -> bytes:
+    def build_config_joint_mode(self, axis_mask: int = 0b111) -> bytes:
+        """Write packet #3 exactly as official tool style (ASCII '0'/'1'/'2')."""
         pkt = self._new_packet(self.PACKET_WRITE_3)
-        one = ord("1") if use_ascii_fields else 0x01
-        zero = ord("0") if use_ascii_fields else 0x00
-        joint = ord("2") if use_ascii_fields else 0x02
-        # bytes 2..4: set mode flags ('1' => apply mode byte for that motor)
-        pkt[2] = one if (axis_mask & 0b001) else zero
-        pkt[3] = one if (axis_mask & 0b010) else zero
-        pkt[4] = one if (axis_mask & 0b100) else zero
-        # bytes 5..7: motor mode ('2' => joint mode)
-        pkt[5] = joint
-        pkt[6] = joint
-        pkt[7] = joint
-        # bytes 14..16: turn on motors ('1' => on)
-        pkt[14] = one if (axis_mask & 0b001) else zero
-        pkt[15] = one if (axis_mask & 0b010) else zero
-        pkt[16] = one if (axis_mask & 0b100) else zero
-        # byte 30: data mode packet (0x02 => extended packet)
-        pkt[30] = 0x02
+
+        pkt[2] = ord("1") if axis_mask & 0b001 else ord("0")
+        pkt[3] = ord("1") if axis_mask & 0b010 else ord("0")
+        pkt[4] = ord("1") if axis_mask & 0b100 else ord("0")
+
+        pkt[5] = ord("2")  # joint mode motor 1
+        pkt[6] = ord("2")  # joint mode motor 2
+        pkt[7] = ord("2")  # joint mode motor 3
+
+        pkt[14] = ord("1") if axis_mask & 0b001 else ord("0")
+        pkt[15] = ord("1") if axis_mask & 0b010 else ord("0")
+        pkt[16] = ord("1") if axis_mask & 0b100 else ord("0")
+
+        pkt[30] = 0x01
         return bytes(pkt)
 
-    def build_init_packet_enable_torque(self, axis_mask: int = 0b111) -> bytes:
+    def build_write1(
+        self,
+        *,
+        axis_mask: int = 0b111,
+        set_data_rate: bool = False,
+        data_rate_units_10ms: int = 1,
+        set_torque_limit: bool = True,
+        torque_limit_raw: int = 1023,
+        set_max_torque: bool = True,
+        max_torque_raw: int = 1023,
+    ) -> bytes:
+        """Write packet #1 (matches MATLAB sendPacket1ToGyroboard semantics)."""
         pkt = self._new_packet(self.PACKET_WRITE_1)
-        # byte 4: set torque enable bitfield (bit0=M1, bit1=M2, bit2=M3)
+
+        pkt[2] = ord("1") if set_data_rate else 0x00
+        pkt[3] = max(1, min(255, data_rate_units_10ms)) if set_data_rate else 0x00
+
         pkt[4] = axis_mask & 0x07
+
+        tl_mask = (axis_mask & 0x07) if set_torque_limit else 0x00
+        pkt[5] = tl_mask
+        tl = max(0, min(1023, torque_limit_raw))
+        self._set_u16_le(pkt, 6, tl)
+        self._set_u16_le(pkt, 8, tl)
+        self._set_u16_le(pkt, 10, tl)
+
+        mt_mask = (axis_mask & 0x07) if set_max_torque else 0x00
+        pkt[12] = mt_mask
+        mt = max(0, min(1023, max_torque_raw))
+        self._set_u16_le(pkt, 13, mt)
+        self._set_u16_le(pkt, 15, mt)
+        self._set_u16_le(pkt, 17, mt)
+
+        pkt[30] = 0x00
         return bytes(pkt)
 
-    def build_set_position(self, x_deg: float, y_deg: float, z_deg: float, axis_mask: int = 0b111) -> bytes:
+    def build_position_packet(
+        self,
+        x_deg: float,
+        y_deg: float,
+        z_deg: float,
+        *,
+        axis_mask: int = 0b111,
+        velocity_mask: int | None = None,
+        velocity_raw: int = 90,
+    ) -> bytes:
+        """Write packet #2 for JOINT mode position control."""
         pkt = self._new_packet(self.PACKET_WRITE_2)
-        pkt[22] = axis_mask & 0x07
 
-        self._set_u16_le(pkt, 23, self._deg_to_position(x_deg))
-        self._set_u16_le(pkt, 25, self._deg_to_position(y_deg))
-        self._set_u16_le(pkt, 27, self._deg_to_position(z_deg))
+        # Angle-limit fields copied from official tool's SetPosition() helper.
+        pkt[2] = 0x00
+        pkt[3] = 0x01
+        pkt[4] = 0x00
+        pkt[5] = 0x01
+        pkt[6] = 0x00
+        pkt[7] = 0x01
+        pkt[8] = 0x00
+        pkt[9] = 0xFF
+        pkt[10] = 0x03
+        pkt[11] = 0xFF
+        pkt[12] = 0x03
+        pkt[13] = 0xFF
+        pkt[14] = 0x03
+
+        vel_mask = axis_mask if velocity_mask is None else velocity_mask
+        pkt[15] = vel_mask & 0x07
+        v = max(0, min(1023, velocity_raw))
+        self._set_u16_le(pkt, 16, v)
+        self._set_u16_le(pkt, 18, v)
+        self._set_u16_le(pkt, 20, v)
+
+        pkt[22] = axis_mask & 0x07
+        self._set_u16_le(pkt, 23, self._deg_to_raw(x_deg))
+        self._set_u16_le(pkt, 25, self._deg_to_raw(y_deg))
+        self._set_u16_le(pkt, 27, self._deg_to_raw(z_deg))
+
+        pkt[30] = 0x00
         return bytes(pkt)
 
-    def build_read_packet(self, packet_number: int, mode_byte: int = 0x01) -> bytes:
+    def build_read_packet(self, packet_number: int, mode_byte: int) -> bytes:
         pkt = self._new_packet(packet_number)
-        # byte 30 is protocol-version dependent across FFT Gyro firmware variants.
-        # 0x01 is most common for read requests; some firmware expects 0x00/0x02.
         pkt[30] = mode_byte & 0xFF
         return bytes(pkt)
 
-    @classmethod
-    def _u16_le(cls, pkt: bytes, offset: int) -> int:
+    @staticmethod
+    def _u16_le(pkt: bytes, offset: int) -> int:
         return pkt[offset] | (pkt[offset + 1] << 8)
 
-    @classmethod
-    def position_to_degrees(cls, position: int) -> float:
-        return (position * cls.DEG_PER_POSITION) - 150.0
-
-    def parse_feedback_positions(self, pkt: bytes) -> tuple[float, float, float] | None:
-        if len(pkt) != self.PACKET_SIZE:
-            return None
-        if pkt[0] != self.START_BYTE or pkt[31] != self.END_BYTE:
-            return None
-        if pkt[1] != self.PACKET_WRITE_2:
+    def parse_motor_stream_packet(self, pkt: bytes) -> dict[str, tuple[float, float, float]] | None:
+        """Parse 32-byte motor telemetry packet (packet type 0x01 from device)."""
+        if len(pkt) != 32 or pkt[0] != self.START_BYTE or pkt[31] != self.END_BYTE or pkt[1] != 0x01:
             return None
 
-        raw_x = self._u16_le(pkt, 23)
-        raw_y = self._u16_le(pkt, 25)
-        raw_z = self._u16_le(pkt, 27)
-        return (
-            self.position_to_degrees(raw_x),
-            self.position_to_degrees(raw_y),
-            self.position_to_degrees(raw_z),
-        )
+        pos1 = self._u16_le(pkt, 18) * self.motor_res_deg
+        pos2 = self._u16_le(pkt, 20) * self.motor_res_deg
+        pos3 = self._u16_le(pkt, 22) * self.motor_res_deg
+
+        vel1 = (self._u16_le(pkt, 12) & 1023) * 0.1113
+        vel2 = (self._u16_le(pkt, 14) & 1023) * 0.1113
+        vel3 = (self._u16_le(pkt, 16) & 1023) * 0.1113
+
+        tor1 = self._u16_le(pkt, 6) * 0.0977
+        tor2 = self._u16_le(pkt, 8) * 0.0977
+        tor3 = self._u16_le(pkt, 10) * 0.0977
+
+        return {
+            "position_deg": (pos1, pos2, pos3),
+            "velocity_rpm": (vel1, vel2, vel3),
+            "torque_pct": (tor1, tor2, tor3),
+        }
 
 
 class SerialController:
@@ -171,63 +214,52 @@ class SerialController:
     def connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
-    def connect(self, port: str, baud: int = DEFAULT_BAUD) -> None:
+    def connect(self, port: str, baud: int) -> None:
         if serial is None:
             raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
-
         with self._lock:
             self.disconnect()
-            LOGGER.info("Connecting to %s @ %d", port, baud)
-            self._ser = serial.Serial(
-                port=port,
-                baudrate=baud,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=0.1,
-            )
-            LOGGER.info("Connected to %s @ %d", port, baud)
+            self._ser = serial.Serial(port=port, baudrate=baud, timeout=0.1)
 
     def disconnect(self) -> None:
         with self._lock:
             if self._ser is not None:
                 try:
-                    LOGGER.info("Disconnecting serial port %s", self._ser.port)
                     self._ser.close()
                 finally:
                     self._ser = None
-
-    def send_position(self, x_deg: float, y_deg: float, z_deg: float, axis_mask: int = 0b111) -> None:
-        pkt = self.protocol.build_set_position(x_deg, y_deg, z_deg, axis_mask)
-        self.send_raw(pkt)
-        LOGGER.info(
-            "Sent position x=%.3f y=%.3f z=%.3f mask=0x%02X packet=%s",
-            x_deg,
-            y_deg,
-            z_deg,
-            axis_mask,
-            pkt.hex(),
-        )
-
-    def initialize_motors(self, axis_mask: int = 0b111) -> None:
-        # Some firmware revisions expect ASCII-coded mode fields ("1"/"2"),
-        # while others expect raw numeric bytes (0x01/0x02). Send both forms.
-        self.send_raw(self.protocol.build_init_packet_set_joint_and_enable(axis_mask, use_ascii_fields=True))
-        time.sleep(0.03)
-        self.send_raw(self.protocol.build_init_packet_set_joint_and_enable(axis_mask, use_ascii_fields=False))
-        time.sleep(0.03)
-        self.send_raw(self.protocol.build_init_packet_enable_torque(axis_mask))
-        time.sleep(0.03)
-        # Send center position once so enabled motors receive a valid motion packet.
-        self.send_position(0.0, 0.0, 0.0, axis_mask=axis_mask)
-        LOGGER.info("Sent motor initialization packets for mask=0x%02X", axis_mask)
 
     def send_raw(self, pkt: bytes) -> None:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
             self._ser.write(pkt)
-            LOGGER.info("Sent raw packet=%s", pkt.hex())
+
+    def initialize_for_joint_position_mode(self, axis_mask: int = 0b111) -> None:
+        self.send_raw(self.protocol.build_config_joint_mode(axis_mask=axis_mask))
+        time.sleep(0.2)
+        self.send_raw(
+            self.protocol.build_write1(
+                axis_mask=axis_mask,
+                set_data_rate=False,
+                set_torque_limit=True,
+                torque_limit_raw=1023,
+                set_max_torque=True,
+                max_torque_raw=1023,
+            )
+        )
+        time.sleep(0.2)
+
+    def send_position(self, x_deg: float, y_deg: float, z_deg: float, axis_mask: int = 0b111, velocity_raw: int = 90) -> None:
+        pkt = self.protocol.build_position_packet(
+            x_deg,
+            y_deg,
+            z_deg,
+            axis_mask=axis_mask,
+            velocity_mask=axis_mask,
+            velocity_raw=velocity_raw,
+        )
+        self.send_raw(pkt)
 
     def _read_framed_packet(self, timeout_s: float) -> bytes:
         deadline = time.monotonic() + timeout_s
@@ -238,64 +270,36 @@ class SerialController:
                 continue
             b = chunk[0]
             if not buf:
-                if b != self.protocol.START_BYTE:
-                    continue
-                buf.append(b)
+                if b == self.protocol.START_BYTE:
+                    buf.append(b)
                 continue
             buf.append(b)
             if len(buf) == self.protocol.PACKET_SIZE:
                 if buf[-1] == self.protocol.END_BYTE:
                     return bytes(buf)
-                # Resync on the last observed START byte.
-                try:
-                    start_idx = buf.index(self.protocol.START_BYTE, 1)
-                    buf = bytearray(buf[start_idx:])
-                except ValueError:
-                    buf.clear()
+                buf.clear()
         return bytes(buf)
 
-    def query_packet(self, packet_number: int, timeout_s: float = 0.45) -> bytes:
+    def request_feedback(self) -> tuple[bytes, bytes, dict[str, tuple[float, float, float]] | None]:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
-
-            old_timeout = self._ser.timeout
-            self._ser.timeout = timeout_s
-            try:
-                reply = b""
-                for mode_byte in (0x01, 0x00, 0x02):
-                    req = self.protocol.build_read_packet(packet_number, mode_byte=mode_byte)
-                    self._ser.reset_input_buffer()
-                    self._ser.write(req)
-                    candidate = self._read_framed_packet(timeout_s)
-                    if (
-                        len(candidate) == self.protocol.PACKET_SIZE
-                        and candidate[0] == self.protocol.START_BYTE
-                        and candidate[-1] == self.protocol.END_BYTE
-                    ):
-                        reply = candidate
-                        break
-                    reply = candidate
-            finally:
-                self._ser.timeout = old_timeout
-
-        LOGGER.info(
-            "Read request packet_number=0x%02X response=%s (len=%d)",
-            packet_number,
-            reply.hex(),
-            len(reply),
-        )
-        return reply
-
-    def query_motor_feedback(self) -> dict[str, object]:
-        pkt1 = self.query_packet(self.protocol.PACKET_WRITE_1)
-        pkt2 = self.query_packet(self.protocol.PACKET_WRITE_2)
-        parsed = self.protocol.parse_feedback_positions(pkt2)
-        return {
-            "packet_1_hex": pkt1.hex(),
-            "packet_2_hex": pkt2.hex(),
-            "packet_2_positions_deg": parsed,
-        }
+            p1 = b""
+            p2 = b""
+            for mode in (0x01, 0x00, 0x02):
+                self._ser.reset_input_buffer()
+                self._ser.write(self.protocol.build_read_packet(0x01, mode))
+                p1 = self._read_framed_packet(0.35)
+                if len(p1) == 32:
+                    break
+            for mode in (0x01, 0x00, 0x02):
+                self._ser.reset_input_buffer()
+                self._ser.write(self.protocol.build_read_packet(0x02, mode))
+                p2 = self._read_framed_packet(0.35)
+                if len(p2) == 32:
+                    break
+        parsed = self.protocol.parse_motor_stream_packet(p1)
+        return p1, p2, parsed
 
 
 class AxisFrame(ttk.LabelFrame):
@@ -303,196 +307,147 @@ class AxisFrame(ttk.LabelFrame):
         super().__init__(master, text=f"Axis {axis_name}")
 
         self.enabled_var = tk.BooleanVar(value=False)
-        self.amplitude_var = tk.DoubleVar(value=0.0)
-        self.frequency_var = tk.DoubleVar(value=0.1)
-        self.position_var = tk.DoubleVar(value=0.0)
+        self.amplitude_var = tk.DoubleVar(value=15.0)
+        self.frequency_var = tk.DoubleVar(value=0.3)
+        self.position_var = tk.DoubleVar(value=180.0)
 
         ttk.Checkbutton(self, text="Enable sine", variable=self.enabled_var).grid(row=0, column=0, columnspan=2, sticky="w")
-
         ttk.Label(self, text="Amplitude (deg)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(self, textvariable=self.amplitude_var, width=12).grid(row=1, column=1, sticky="ew")
-
+        ttk.Entry(self, textvariable=self.amplitude_var, width=10).grid(row=1, column=1, sticky="ew")
         ttk.Label(self, text="Frequency (Hz)").grid(row=2, column=0, sticky="w")
-        ttk.Entry(self, textvariable=self.frequency_var, width=12).grid(row=2, column=1, sticky="ew")
-
-        ttk.Label(self, text="Set position (deg)").grid(row=3, column=0, sticky="w")
-        ttk.Entry(self, textvariable=self.position_var, width=12).grid(row=3, column=1, sticky="ew")
-
+        ttk.Entry(self, textvariable=self.frequency_var, width=10).grid(row=2, column=1, sticky="ew")
+        ttk.Label(self, text="Target position (deg)").grid(row=3, column=0, sticky="w")
+        ttk.Entry(self, textvariable=self.position_var, width=10).grid(row=3, column=1, sticky="ew")
         self.columnconfigure(1, weight=1)
 
-    def get_state(self) -> AxisState:
-        return AxisState(
+    def read(self) -> AxisCommand:
+        return AxisCommand(
+            enabled=bool(self.enabled_var.get()),
             amplitude_deg=float(self.amplitude_var.get()),
             frequency_hz=float(self.frequency_var.get()),
-            enabled=bool(self.enabled_var.get()),
+            target_deg=float(self.position_var.get()),
         )
 
 
 class App(tk.Tk):
-    UPDATE_PERIOD_S = 0.02
+    UPDATE_PERIOD_S = 0.03
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("FFT Gyro Axis Controller")
-        self.geometry("760x460")
+        self.title("FFT Gyro Controller (Protocol-correct)")
+        self.geometry("860x500")
 
         self.protocol_obj = FFTGyroProtocol()
         self.serial = SerialController(self.protocol_obj)
 
         self._running = False
-        self._start_time = 0.0
-        self._port_details: dict[str, object] = {}
+        self._start_t = 0.0
+        self._ports_cache: dict[str, object] = {}
 
         self.port_var = tk.StringVar(value="")
-        self.baud_var = tk.IntVar(value=DEFAULT_BAUD)
+        self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
+        self.speed_raw_var = tk.IntVar(value=90)
         self.status_var = tk.StringVar(value="Disconnected")
 
         self.axis_frames: dict[str, AxisFrame] = {}
-
         self._build_ui()
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
 
-        ttk.Label(top, text="COM Port").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="Port").grid(row=0, column=0, sticky="w")
         self.port_combo = ttk.Combobox(top, textvariable=self.port_var, width=16)
-        self.port_combo.grid(row=0, column=1, padx=(4, 12), sticky="w")
+        self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 12))
         ttk.Button(top, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=(0, 12))
 
         ttk.Label(top, text="Baud").grid(row=0, column=3, sticky="w")
-        self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=[str(b) for b in COMMON_BAUDS])
-        self.baud_combo.grid(row=0, column=4, padx=(4, 12), sticky="w")
+        self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=[str(v) for v in COMMON_BAUDS])
+        self.baud_combo.grid(row=0, column=4, sticky="w", padx=(4, 12))
 
-        self.connect_btn = ttk.Button(top, text="Connect", command=self.connect_serial)
-        self.connect_btn.grid(row=0, column=5, padx=4)
+        ttk.Label(top, text="Speed raw (0-1023)").grid(row=0, column=5, sticky="w")
+        ttk.Entry(top, textvariable=self.speed_raw_var, width=8).grid(row=0, column=6, sticky="w", padx=(4, 12))
+
+        self.connect_btn = ttk.Button(top, text="Connect + Init", command=self.connect_serial)
+        self.connect_btn.grid(row=0, column=7, padx=4)
         self.disconnect_btn = ttk.Button(top, text="Disconnect", command=self.disconnect_serial)
-        self.disconnect_btn.grid(row=0, column=6, padx=4)
+        self.disconnect_btn.grid(row=0, column=8, padx=4)
 
-        self.status_label = ttk.Label(top, textvariable=self.status_var)
-        self.status_label.grid(row=0, column=7, padx=(20, 0), sticky="w")
+        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=9, sticky="w", padx=(10, 0))
 
-        axis_container = ttk.Frame(self, padding=8)
-        axis_container.pack(fill="both", expand=True)
-
-        for idx, axis in enumerate(AXES):
-            frame = AxisFrame(axis_container, axis)
-            frame.grid(row=0, column=idx, sticky="nsew", padx=6, pady=6)
-            self.axis_frames[axis] = frame
-            axis_container.columnconfigure(idx, weight=1)
+        body = ttk.Frame(self, padding=8)
+        body.pack(fill="both", expand=True)
+        for i, axis in enumerate(AXES):
+            fr = AxisFrame(body, axis)
+            fr.grid(row=0, column=i, sticky="nsew", padx=5)
+            body.columnconfigure(i, weight=1)
+            self.axis_frames[axis] = fr
 
         actions = ttk.Frame(self, padding=8)
         actions.pack(fill="x")
-
-        self.start_btn = ttk.Button(actions, text="Start sine motion", command=self.start_sine)
+        self.start_btn = ttk.Button(actions, text="Start sine", command=self.start_sine)
         self.start_btn.pack(side="left", padx=4)
-        self.stop_btn = ttk.Button(actions, text="Stop sine motion", command=self.stop_sine)
+        self.stop_btn = ttk.Button(actions, text="Stop", command=self.stop_sine)
         self.stop_btn.pack(side="left", padx=4)
-        self.set_x_btn = ttk.Button(actions, text="Set X", command=lambda: self.set_single_axis("X"))
-        self.set_x_btn.pack(side="left", padx=4)
-        self.set_y_btn = ttk.Button(actions, text="Set Y", command=lambda: self.set_single_axis("Y"))
-        self.set_y_btn.pack(side="left", padx=4)
-        self.set_z_btn = ttk.Button(actions, text="Set Z", command=lambda: self.set_single_axis("Z"))
-        self.set_z_btn.pack(side="left", padx=4)
-        self.set_all_btn = ttk.Button(actions, text="Set all", command=self.set_all_axes)
-        self.set_all_btn.pack(side="left", padx=4)
-        self.read_btn = ttk.Button(actions, text="Read motor feedback", command=self.read_motor_feedback)
-        self.read_btn.pack(side="left", padx=4)
+        ttk.Button(actions, text="Set X", command=lambda: self.set_single("X")).pack(side="left", padx=4)
+        ttk.Button(actions, text="Set Y", command=lambda: self.set_single("Y")).pack(side="left", padx=4)
+        ttk.Button(actions, text="Set Z", command=lambda: self.set_single("Z")).pack(side="left", padx=4)
+        ttk.Button(actions, text="Set all", command=self.set_all).pack(side="left", padx=4)
+        ttk.Button(actions, text="Read feedback", command=self.read_feedback).pack(side="left", padx=4)
 
         self.refresh_ports()
         self._update_ui_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def refresh_ports(self) -> None:
-        ports = []
-        self._port_details.clear()
-        if list_ports is not None:
-            for p in list_ports.comports():
-                ports.append(p.device)
-                self._port_details[p.device] = p
-        self.port_combo["values"] = ports
-        if not ports:
-            self.port_var.set("")
-            return
-
-        preferred = self._find_preferred_port(ports)
-        current = self.port_var.get().strip()
-        if current not in ports:
-            self.port_var.set(preferred)
-
-    def _find_preferred_port(self, ports: list[str]) -> str:
-        for port in ports:
-            info = self._port_details.get(port)
-            if info is None:
-                continue
-            hay = " ".join(
-                str(v).lower()
-                for v in (
-                    getattr(info, "device", ""),
-                    getattr(info, "description", ""),
-                    getattr(info, "manufacturer", ""),
-                    getattr(info, "product", ""),
-                    getattr(info, "interface", ""),
-                )
-            )
-            if any(token in hay for token in ("fft", "gyro", "cp210", "ch340", "usb serial", "uart", "ftdi")):
-                return port
-        return ports[0]
-
-    def _set_status(self, text: str, ok: bool = False) -> None:
+    def _status(self, text: str, ok: bool = True) -> None:
         self.status_var.set(text)
-        self.status_label.configure(foreground="#0a4" if ok else "#a00")
-        if ok:
-            LOGGER.info(text)
-        else:
-            LOGGER.warning(text)
+        LOGGER.info(text) if ok else LOGGER.warning(text)
 
     def _update_ui_state(self) -> None:
         connected = self.serial.connected
         self.connect_btn.configure(state="disabled" if connected else "normal")
         self.disconnect_btn.configure(state="normal" if connected else "disabled")
+        state = "normal" if connected else "disabled"
+        self.start_btn.configure(state=state)
+        self.stop_btn.configure(state=state)
 
-        action_state = "normal" if connected else "disabled"
-        for btn in (self.start_btn, self.stop_btn, self.set_x_btn, self.set_y_btn, self.set_z_btn, self.set_all_btn, self.read_btn):
-            btn.configure(state=action_state)
+    def refresh_ports(self) -> None:
+        ports: list[str] = []
+        self._ports_cache.clear()
+        if list_ports is not None:
+            for p in list_ports.comports():
+                ports.append(p.device)
+                self._ports_cache[p.device] = p
+        self.port_combo["values"] = ports
+        if ports and self.port_var.get() not in ports:
+            self.port_var.set(ports[0])
 
-    def _safe_float(self, raw: object, field_name: str) -> float:
-        try:
-            return float(raw)
-        except Exception as exc:
-            raise ValueError(f"Invalid numeric value for {field_name}: {raw!r}") from exc
+    def _axis_values(self, axis: str) -> AxisCommand:
+        cmd = self.axis_frames[axis].read()
+        if cmd.frequency_hz < 0 or cmd.frequency_hz > MAX_FREQUENCY_HZ:
+            raise ValueError(f"{axis}: frequency must be 0..{MAX_FREQUENCY_HZ} Hz")
+        if cmd.target_deg < 0 or cmd.target_deg > DEFAULT_MAX_ANGLE_DEG:
+            raise ValueError(f"{axis}: target must be 0..{DEFAULT_MAX_ANGLE_DEG}°")
+        if abs(cmd.amplitude_deg) > DEFAULT_MAX_ANGLE_DEG:
+            raise ValueError(f"{axis}: amplitude too large")
+        return cmd
 
-    def _validated_axis_inputs(self, axis: str) -> tuple[float, float, float]:
-        frame = self.axis_frames[axis]
-        amplitude = self._safe_float(frame.amplitude_var.get(), f"{axis} amplitude")
-        frequency = self._safe_float(frame.frequency_var.get(), f"{axis} frequency")
-        position = self._safe_float(frame.position_var.get(), f"{axis} position")
-
-        if abs(amplitude) > MAX_ABS_AMPLITUDE_DEG:
-            raise ValueError(f"{axis} amplitude out of range ±{MAX_ABS_AMPLITUDE_DEG}°")
-        if frequency < 0 or frequency > MAX_FREQUENCY_HZ:
-            raise ValueError(f"{axis} frequency must be between 0 and {MAX_FREQUENCY_HZ} Hz")
-        if abs(position) > MAX_ABS_POSITION_DEG:
-            raise ValueError(f"{axis} position out of range ±{MAX_ABS_POSITION_DEG}°")
-
-        return amplitude, frequency, position
-
-    def _validate_all_axes(self) -> None:
-        for axis in AXES:
-            self._validated_axis_inputs(axis)
+    def _velocity_raw(self) -> int:
+        v = int(self.speed_raw_var.get())
+        if v < 0 or v > 1023:
+            raise ValueError("Speed raw must be in 0..1023")
+        return v
 
     def connect_serial(self) -> None:
         try:
             port = self.port_var.get().strip()
             if not port:
-                raise ValueError("Select a COM port before connecting")
-            baud = int(self._safe_float(self.baud_var.get(), "baud"))
-            if baud <= 0:
-                raise ValueError("Baud must be a positive integer")
-
+                raise ValueError("Select a serial port")
+            baud = int(self.baud_var.get())
             self.serial.connect(port, baud)
-            self.serial.initialize_motors(0b111)
-            self._set_status(f"Connected: {port} @ {baud}", ok=True)
+            self.serial.initialize_for_joint_position_mode(0b111)
+            self.serial.send_position(180.0, 180.0, 180.0, axis_mask=0b111, velocity_raw=self._velocity_raw())
+            self._status(f"Connected and initialized: {port} @ {baud}", ok=True)
             self._update_ui_state()
         except Exception as exc:
             messagebox.showerror("Connection error", str(exc))
@@ -500,23 +455,45 @@ class App(tk.Tk):
     def disconnect_serial(self) -> None:
         self.stop_sine()
         self.serial.disconnect()
-        self._set_status("Disconnected", ok=False)
+        self._status("Disconnected", ok=False)
         self._update_ui_state()
+
+    def set_single(self, axis: str) -> None:
+        if not self.serial.connected:
+            messagebox.showwarning("Not connected", "Connect first")
+            return
+        try:
+            idx = AXES.index(axis)
+            vals = [180.0, 180.0, 180.0]
+            vals[idx] = self._axis_values(axis).target_deg
+            self.serial.send_position(vals[0], vals[1], vals[2], axis_mask=(1 << idx), velocity_raw=self._velocity_raw())
+        except Exception as exc:
+            messagebox.showerror("Command error", str(exc))
+
+    def set_all(self) -> None:
+        if not self.serial.connected:
+            messagebox.showwarning("Not connected", "Connect first")
+            return
+        try:
+            vals = [self._axis_values(a).target_deg for a in AXES]
+            self.serial.send_position(vals[0], vals[1], vals[2], axis_mask=0b111, velocity_raw=self._velocity_raw())
+        except Exception as exc:
+            messagebox.showerror("Command error", str(exc))
 
     def start_sine(self) -> None:
         if not self.serial.connected:
-            messagebox.showwarning("Not connected", "Connect a COM port first")
-            return
-        if self._running:
+            messagebox.showwarning("Not connected", "Connect first")
             return
         try:
-            self._validate_all_axes()
-        except ValueError as exc:
+            for ax in AXES:
+                self._axis_values(ax)
+            self._velocity_raw()
+        except Exception as exc:
             messagebox.showerror("Input error", str(exc))
             return
 
         self._running = True
-        self._start_time = time.monotonic()
+        self._start_t = time.monotonic()
         self._tick()
 
     def stop_sine(self) -> None:
@@ -526,108 +503,64 @@ class App(tk.Tk):
         if not self._running:
             return
 
-        t = time.monotonic() - self._start_time
-        x, y, z = self._calc_sine_positions(t)
-        mask = self._enabled_axis_mask()
+        t = time.monotonic() - self._start_t
+        cmds = [self._axis_values(a) for a in AXES]
+
+        vals = []
+        mask = 0
+        for i, cmd in enumerate(cmds):
+            base = 180.0
+            if cmd.enabled:
+                v = base + cmd.amplitude_deg * math.sin(2 * math.pi * cmd.frequency_hz * t)
+                mask |= (1 << i)
+            else:
+                v = cmd.target_deg
+            vals.append(max(0.0, min(DEFAULT_MAX_ANGLE_DEG, v)))
 
         if mask:
             try:
-                self.serial.send_position(x, y, z, axis_mask=mask)
+                self.serial.send_position(vals[0], vals[1], vals[2], axis_mask=mask, velocity_raw=self._velocity_raw())
             except Exception as exc:
-                self.stop_sine()
+                self._running = False
                 messagebox.showerror("Serial error", str(exc))
                 return
 
         self.after(int(self.UPDATE_PERIOD_S * 1000), self._tick)
 
-    def _calc_sine_positions(self, t: float) -> tuple[float, float, float]:
-        out = []
-        for axis in AXES:
-            amplitude, frequency, _ = self._validated_axis_inputs(axis)
-            state = self.axis_frames[axis].get_state()
-            if state.enabled:
-                value = amplitude * math.sin(2.0 * math.pi * frequency * t)
-            else:
-                value = 0.0
-            out.append(value)
-        return out[0], out[1], out[2]
-
-    def _enabled_axis_mask(self) -> int:
-        mask = 0
-        for idx, axis in enumerate(AXES):
-            if self.axis_frames[axis].enabled_var.get():
-                mask |= (1 << idx)
-        return mask
-
-    def set_single_axis(self, axis: str) -> None:
+    def read_feedback(self) -> None:
         if not self.serial.connected:
-            messagebox.showwarning("Not connected", "Connect a COM port first")
-            return
-
-        values = [0.0, 0.0, 0.0]
-        idx = AXES.index(axis)
-        try:
-            _, _, position = self._validated_axis_inputs(axis)
-            values[idx] = position
-        except Exception as exc:
-            messagebox.showerror("Input error", str(exc))
-            return
-
-        try:
-            self.serial.send_position(values[0], values[1], values[2], axis_mask=(1 << idx))
-        except Exception as exc:
-            messagebox.showerror("Serial error", str(exc))
-
-    def set_all_axes(self) -> None:
-        if not self.serial.connected:
-            messagebox.showwarning("Not connected", "Connect a COM port first")
-            return
-
-        try:
-            values = [self._validated_axis_inputs(a)[2] for a in AXES]
-        except Exception as exc:
-            messagebox.showerror("Input error", str(exc))
+            messagebox.showwarning("Not connected", "Connect first")
             return
         try:
-            self.serial.send_position(values[0], values[1], values[2], axis_mask=0b111)
+            p1, p2, parsed = self.serial.request_feedback()
         except Exception as exc:
-            messagebox.showerror("Serial error", str(exc))
-
-    def read_motor_feedback(self) -> None:
-        if not self.serial.connected:
-            messagebox.showwarning("Not connected", "Connect a COM port first")
+            messagebox.showerror("Read error", str(exc))
             return
 
-        try:
-            result = self.serial.query_motor_feedback()
-        except Exception as exc:
-            messagebox.showerror("Serial error", str(exc))
-            return
-
-        positions = result["packet_2_positions_deg"]
-        if positions is None:
-            parsed_text = "Unable to parse packet #2 as position feedback."
-        else:
-            parsed_text = (
-                f"Estimated positions from packet #2:\n"
-                f"X={positions[0]:.2f}°, Y={positions[1]:.2f}°, Z={positions[2]:.2f}°"
+        parsed_txt = "No parsed motor packet (type 0x01) returned."
+        if parsed is not None:
+            p = parsed["position_deg"]
+            v = parsed["velocity_rpm"]
+            tq = parsed["torque_pct"]
+            parsed_txt = (
+                f"Parsed packet#1:\n"
+                f"Position deg: {p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f}\n"
+                f"Velocity rpm: {v[0]:.2f}, {v[1]:.2f}, {v[2]:.2f}\n"
+                f"Torque %: {tq[0]:.2f}, {tq[1]:.2f}, {tq[2]:.2f}"
             )
 
-        details = (
-            "Read complete.\n\n"
-            f"Packet #1 response ({len(result['packet_1_hex']) // 2} bytes):\n{result['packet_1_hex']}\n\n"
-            f"Packet #2 response ({len(result['packet_2_hex']) // 2} bytes):\n{result['packet_2_hex']}\n\n"
-            f"{parsed_text}\n\n"
-            "Tip: If responses are empty or malformed, verify baud, packet layout, and read/write mode byte."
+        msg = (
+            f"Packet #1 ({len(p1)} bytes): {p1.hex()}\n\n"
+            f"Packet #2 ({len(p2)} bytes): {p2.hex()}\n\n"
+            f"{parsed_txt}"
         )
-        messagebox.showinfo("Motor feedback", details)
+        messagebox.showinfo("Feedback", msg)
 
     def _on_close(self) -> None:
         self.stop_sine()
-        self.disconnect_serial()
+        self.serial.disconnect()
         self.destroy()
 
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    App().mainloop()
