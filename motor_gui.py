@@ -125,6 +125,38 @@ class FFTGyroProtocol:
         self._set_u16_le(pkt, 27, self._deg_to_position(z_deg))
         return bytes(pkt)
 
+    def build_read_packet(self, packet_number: int) -> bytes:
+        pkt = self._new_packet(packet_number)
+        # byte 30 is documented as data mode in this protocol.
+        # 0x02 is used for extended write packets; 0x01 is used here for read requests.
+        pkt[30] = 0x01
+        return bytes(pkt)
+
+    @classmethod
+    def _u16_le(cls, pkt: bytes, offset: int) -> int:
+        return pkt[offset] | (pkt[offset + 1] << 8)
+
+    @classmethod
+    def position_to_degrees(cls, position: int) -> float:
+        return (position * cls.DEG_PER_POSITION) - 150.0
+
+    def parse_feedback_positions(self, pkt: bytes) -> tuple[float, float, float] | None:
+        if len(pkt) != self.PACKET_SIZE:
+            return None
+        if pkt[0] != self.START_BYTE or pkt[31] != self.END_BYTE:
+            return None
+        if pkt[1] != self.PACKET_WRITE_2:
+            return None
+
+        raw_x = self._u16_le(pkt, 23)
+        raw_y = self._u16_le(pkt, 25)
+        raw_z = self._u16_le(pkt, 27)
+        return (
+            self.position_to_degrees(raw_x),
+            self.position_to_degrees(raw_y),
+            self.position_to_degrees(raw_z),
+        )
+
 
 class SerialController:
     def __init__(self, protocol: FFTGyroProtocol) -> None:
@@ -185,6 +217,40 @@ class SerialController:
                 raise RuntimeError("Serial port is not connected")
             self._ser.write(pkt)
             LOGGER.info("Sent raw packet=%s", pkt.hex())
+
+    def query_packet(self, packet_number: int, timeout_s: float = 0.35) -> bytes:
+        req = self.protocol.build_read_packet(packet_number)
+        with self._lock:
+            if not self.connected:
+                raise RuntimeError("Serial port is not connected")
+
+            old_timeout = self._ser.timeout
+            self._ser.timeout = timeout_s
+            try:
+                self._ser.reset_input_buffer()
+                self._ser.write(req)
+                reply = self._ser.read(self.protocol.PACKET_SIZE)
+            finally:
+                self._ser.timeout = old_timeout
+
+        LOGGER.info(
+            "Read request packet_number=0x%02X request=%s response=%s (len=%d)",
+            packet_number,
+            req.hex(),
+            reply.hex(),
+            len(reply),
+        )
+        return reply
+
+    def query_motor_feedback(self) -> dict[str, object]:
+        pkt1 = self.query_packet(self.protocol.PACKET_WRITE_1)
+        pkt2 = self.query_packet(self.protocol.PACKET_WRITE_2)
+        parsed = self.protocol.parse_feedback_positions(pkt2)
+        return {
+            "packet_1_hex": pkt1.hex(),
+            "packet_2_hex": pkt2.hex(),
+            "packet_2_positions_deg": parsed,
+        }
 
 
 class AxisFrame(ttk.LabelFrame):
@@ -285,6 +351,8 @@ class App(tk.Tk):
         self.set_z_btn.pack(side="left", padx=4)
         self.set_all_btn = ttk.Button(actions, text="Set all", command=self.set_all_axes)
         self.set_all_btn.pack(side="left", padx=4)
+        self.read_btn = ttk.Button(actions, text="Read motor feedback", command=self.read_motor_feedback)
+        self.read_btn.pack(side="left", padx=4)
 
         self.refresh_ports()
         self._update_ui_state()
@@ -340,7 +408,7 @@ class App(tk.Tk):
         self.disconnect_btn.configure(state="normal" if connected else "disabled")
 
         action_state = "normal" if connected else "disabled"
-        for btn in (self.start_btn, self.stop_btn, self.set_x_btn, self.set_y_btn, self.set_z_btn, self.set_all_btn):
+        for btn in (self.start_btn, self.stop_btn, self.set_x_btn, self.set_y_btn, self.set_z_btn, self.set_all_btn, self.read_btn):
             btn.configure(state=action_state)
 
     def _safe_float(self, raw: object, field_name: str) -> float:
@@ -479,6 +547,35 @@ class App(tk.Tk):
             self.serial.send_position(values[0], values[1], values[2], axis_mask=0b111)
         except Exception as exc:
             messagebox.showerror("Serial error", str(exc))
+
+    def read_motor_feedback(self) -> None:
+        if not self.serial.connected:
+            messagebox.showwarning("Not connected", "Connect a COM port first")
+            return
+
+        try:
+            result = self.serial.query_motor_feedback()
+        except Exception as exc:
+            messagebox.showerror("Serial error", str(exc))
+            return
+
+        positions = result["packet_2_positions_deg"]
+        if positions is None:
+            parsed_text = "Unable to parse packet #2 as position feedback."
+        else:
+            parsed_text = (
+                f"Estimated positions from packet #2:\n"
+                f"X={positions[0]:.2f}°, Y={positions[1]:.2f}°, Z={positions[2]:.2f}°"
+            )
+
+        details = (
+            "Read complete.\n\n"
+            f"Packet #1 response ({len(result['packet_1_hex']) // 2} bytes):\n{result['packet_1_hex']}\n\n"
+            f"Packet #2 response ({len(result['packet_2_hex']) // 2} bytes):\n{result['packet_2_hex']}\n\n"
+            f"{parsed_text}\n\n"
+            "Tip: If responses are empty or malformed, verify baud, packet layout, and read/write mode byte."
+        )
+        messagebox.showinfo("Motor feedback", details)
 
     def _on_close(self) -> None:
         self.stop_sine()
