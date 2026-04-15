@@ -34,6 +34,12 @@ except Exception:  # pragma: no cover - runtime dependency
 
 
 AXES = ("X", "Y", "Z")
+DEFAULT_BAUD = 115200
+COMMON_BAUDS = (115200, 230400, 460800, 921600, 57600, 38400, 19200, 9600)
+
+MAX_ABS_AMPLITUDE_DEG = 180.0
+MAX_FREQUENCY_HZ = 20.0
+MAX_ABS_POSITION_DEG = 180.0
 
 
 @dataclass
@@ -156,9 +162,10 @@ class App(tk.Tk):
 
         self._running = False
         self._start_time = 0.0
+        self._port_details: dict[str, object] = {}
 
         self.port_var = tk.StringVar(value="")
-        self.baud_var = tk.IntVar(value=115200)
+        self.baud_var = tk.IntVar(value=DEFAULT_BAUD)
         self.status_var = tk.StringVar(value="Disconnected")
 
         self.axis_frames: dict[str, AxisFrame] = {}
@@ -175,12 +182,16 @@ class App(tk.Tk):
         ttk.Button(top, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=(0, 12))
 
         ttk.Label(top, text="Baud").grid(row=0, column=3, sticky="w")
-        ttk.Entry(top, textvariable=self.baud_var, width=10).grid(row=0, column=4, padx=(4, 12), sticky="w")
+        self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=[str(b) for b in COMMON_BAUDS])
+        self.baud_combo.grid(row=0, column=4, padx=(4, 12), sticky="w")
 
-        ttk.Button(top, text="Connect", command=self.connect_serial).grid(row=0, column=5, padx=4)
-        ttk.Button(top, text="Disconnect", command=self.disconnect_serial).grid(row=0, column=6, padx=4)
+        self.connect_btn = ttk.Button(top, text="Connect", command=self.connect_serial)
+        self.connect_btn.grid(row=0, column=5, padx=4)
+        self.disconnect_btn = ttk.Button(top, text="Disconnect", command=self.disconnect_serial)
+        self.disconnect_btn.grid(row=0, column=6, padx=4)
 
-        ttk.Label(top, textvariable=self.status_var, foreground="#0a4").grid(row=0, column=7, padx=(20, 0), sticky="w")
+        self.status_label = ttk.Label(top, textvariable=self.status_var)
+        self.status_label.grid(row=0, column=7, padx=(20, 0), sticky="w")
 
         axis_container = ttk.Frame(self, padding=8)
         axis_container.pack(fill="both", expand=True)
@@ -194,34 +205,117 @@ class App(tk.Tk):
         actions = ttk.Frame(self, padding=8)
         actions.pack(fill="x")
 
-        ttk.Button(actions, text="Start sine motion", command=self.start_sine).pack(side="left", padx=4)
-        ttk.Button(actions, text="Stop sine motion", command=self.stop_sine).pack(side="left", padx=4)
-        ttk.Button(actions, text="Set X", command=lambda: self.set_single_axis("X")).pack(side="left", padx=4)
-        ttk.Button(actions, text="Set Y", command=lambda: self.set_single_axis("Y")).pack(side="left", padx=4)
-        ttk.Button(actions, text="Set Z", command=lambda: self.set_single_axis("Z")).pack(side="left", padx=4)
-        ttk.Button(actions, text="Set all", command=self.set_all_axes).pack(side="left", padx=4)
+        self.start_btn = ttk.Button(actions, text="Start sine motion", command=self.start_sine)
+        self.start_btn.pack(side="left", padx=4)
+        self.stop_btn = ttk.Button(actions, text="Stop sine motion", command=self.stop_sine)
+        self.stop_btn.pack(side="left", padx=4)
+        self.set_x_btn = ttk.Button(actions, text="Set X", command=lambda: self.set_single_axis("X"))
+        self.set_x_btn.pack(side="left", padx=4)
+        self.set_y_btn = ttk.Button(actions, text="Set Y", command=lambda: self.set_single_axis("Y"))
+        self.set_y_btn.pack(side="left", padx=4)
+        self.set_z_btn = ttk.Button(actions, text="Set Z", command=lambda: self.set_single_axis("Z"))
+        self.set_z_btn.pack(side="left", padx=4)
+        self.set_all_btn = ttk.Button(actions, text="Set all", command=self.set_all_axes)
+        self.set_all_btn.pack(side="left", padx=4)
 
         self.refresh_ports()
+        self._update_ui_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def refresh_ports(self) -> None:
         ports = []
+        self._port_details.clear()
         if list_ports is not None:
-            ports = [p.device for p in list_ports.comports()]
+            for p in list_ports.comports():
+                ports.append(p.device)
+                self._port_details[p.device] = p
         self.port_combo["values"] = ports
-        if not self.port_var.get() and ports:
-            self.port_var.set(ports[0])
+        if not ports:
+            self.port_var.set("")
+            return
+
+        preferred = self._find_preferred_port(ports)
+        current = self.port_var.get().strip()
+        if current not in ports:
+            self.port_var.set(preferred)
+
+    def _find_preferred_port(self, ports: list[str]) -> str:
+        for port in ports:
+            info = self._port_details.get(port)
+            if info is None:
+                continue
+            hay = " ".join(
+                str(v).lower()
+                for v in (
+                    getattr(info, "device", ""),
+                    getattr(info, "description", ""),
+                    getattr(info, "manufacturer", ""),
+                    getattr(info, "product", ""),
+                    getattr(info, "interface", ""),
+                )
+            )
+            if any(token in hay for token in ("fft", "gyro", "cp210", "ch340", "usb serial", "uart", "ftdi")):
+                return port
+        return ports[0]
+
+    def _set_status(self, text: str, ok: bool = False) -> None:
+        self.status_var.set(text)
+        self.status_label.configure(foreground="#0a4" if ok else "#a00")
+
+    def _update_ui_state(self) -> None:
+        connected = self.serial.connected
+        self.connect_btn.configure(state="disabled" if connected else "normal")
+        self.disconnect_btn.configure(state="normal" if connected else "disabled")
+
+        action_state = "normal" if connected else "disabled"
+        for btn in (self.start_btn, self.stop_btn, self.set_x_btn, self.set_y_btn, self.set_z_btn, self.set_all_btn):
+            btn.configure(state=action_state)
+
+    def _safe_float(self, raw: object, field_name: str) -> float:
+        try:
+            return float(raw)
+        except Exception as exc:
+            raise ValueError(f"Invalid numeric value for {field_name}: {raw!r}") from exc
+
+    def _validated_axis_inputs(self, axis: str) -> tuple[float, float, float]:
+        frame = self.axis_frames[axis]
+        amplitude = self._safe_float(frame.amplitude_var.get(), f"{axis} amplitude")
+        frequency = self._safe_float(frame.frequency_var.get(), f"{axis} frequency")
+        position = self._safe_float(frame.position_var.get(), f"{axis} position")
+
+        if abs(amplitude) > MAX_ABS_AMPLITUDE_DEG:
+            raise ValueError(f"{axis} amplitude out of range ±{MAX_ABS_AMPLITUDE_DEG}°")
+        if frequency < 0 or frequency > MAX_FREQUENCY_HZ:
+            raise ValueError(f"{axis} frequency must be between 0 and {MAX_FREQUENCY_HZ} Hz")
+        if abs(position) > MAX_ABS_POSITION_DEG:
+            raise ValueError(f"{axis} position out of range ±{MAX_ABS_POSITION_DEG}°")
+
+        return amplitude, frequency, position
+
+    def _validate_all_axes(self) -> None:
+        for axis in AXES:
+            self._validated_axis_inputs(axis)
 
     def connect_serial(self) -> None:
         try:
-            self.serial.connect(self.port_var.get().strip(), int(self.baud_var.get()))
-            self.status_var.set(f"Connected: {self.port_var.get()}")
+            port = self.port_var.get().strip()
+            if not port:
+                raise ValueError("Select a COM port before connecting")
+            baud = int(self._safe_float(self.baud_var.get(), "baud"))
+            if baud <= 0:
+                raise ValueError("Baud must be a positive integer")
+
+            self.serial.connect(port, baud)
+            self._set_status(f"Connected: {port} @ {baud}", ok=True)
+            self._update_ui_state()
         except Exception as exc:
             messagebox.showerror("Connection error", str(exc))
 
     def disconnect_serial(self) -> None:
+        self.stop_sine()
         self.serial.disconnect()
-        self.status_var.set("Disconnected")
+        self._set_status("Disconnected", ok=False)
+        self._update_ui_state()
 
     def start_sine(self) -> None:
         if not self.serial.connected:
@@ -229,6 +323,12 @@ class App(tk.Tk):
             return
         if self._running:
             return
+        try:
+            self._validate_all_axes()
+        except ValueError as exc:
+            messagebox.showerror("Input error", str(exc))
+            return
+
         self._running = True
         self._start_time = time.monotonic()
         self._tick()
@@ -257,9 +357,10 @@ class App(tk.Tk):
     def _calc_sine_positions(self, t: float) -> tuple[float, float, float]:
         out = []
         for axis in AXES:
+            amplitude, frequency, _ = self._validated_axis_inputs(axis)
             state = self.axis_frames[axis].get_state()
             if state.enabled:
-                value = state.amplitude_deg * math.sin(2.0 * math.pi * state.frequency_hz * t)
+                value = amplitude * math.sin(2.0 * math.pi * frequency * t)
             else:
                 value = 0.0
             out.append(value)
@@ -279,7 +380,12 @@ class App(tk.Tk):
 
         values = [0.0, 0.0, 0.0]
         idx = AXES.index(axis)
-        values[idx] = float(self.axis_frames[axis].position_var.get())
+        try:
+            _, _, position = self._validated_axis_inputs(axis)
+            values[idx] = position
+        except Exception as exc:
+            messagebox.showerror("Input error", str(exc))
+            return
 
         try:
             self.serial.send_position(values[0], values[1], values[2], axis_mask=(1 << idx))
@@ -291,7 +397,11 @@ class App(tk.Tk):
             messagebox.showwarning("Not connected", "Connect a COM port first")
             return
 
-        values = [float(self.axis_frames[a].position_var.get()) for a in AXES]
+        try:
+            values = [self._validated_axis_inputs(a)[2] for a in AXES]
+        except Exception as exc:
+            messagebox.showerror("Input error", str(exc))
+            return
         try:
             self.serial.send_position(values[0], values[1], values[2], axis_mask=0b111)
         except Exception as exc:
