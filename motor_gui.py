@@ -34,8 +34,8 @@ except Exception:  # pragma: no cover - runtime dependency
 
 
 AXES = ("X", "Y", "Z")
-DEFAULT_BAUD = 115200
-COMMON_BAUDS = (115200, 230400, 460800, 921600, 57600, 38400, 19200, 9600)
+DEFAULT_BAUD = 9600
+COMMON_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
 
 MAX_ABS_AMPLITUDE_DEG = 180.0
 MAX_FREQUENCY_HZ = 20.0
@@ -95,13 +95,20 @@ class SerialController:
     def connected(self) -> bool:
         return self._ser is not None and self._ser.is_open
 
-    def connect(self, port: str, baud: int = 115200) -> None:
+    def connect(self, port: str, baud: int = DEFAULT_BAUD) -> None:
         if serial is None:
             raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
 
         with self._lock:
             self.disconnect()
-            self._ser = serial.Serial(port=port, baudrate=baud, timeout=0.1)
+            self._ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.1,
+            )
 
     def disconnect(self) -> None:
         with self._lock:
