@@ -18,7 +18,7 @@ packet structure centralized in FFTGyroProtocol so offsets can be adjusted easil
 from __future__ import annotations
 
 import math
-import struct
+import logging
 import threading
 import time
 import tkinter as tk
@@ -37,9 +37,15 @@ AXES = ("X", "Y", "Z")
 DEFAULT_BAUD = 9600
 COMMON_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
 
-MAX_ABS_AMPLITUDE_DEG = 180.0
+MAX_ABS_AMPLITUDE_DEG = 150.0
 MAX_FREQUENCY_HZ = 20.0
-MAX_ABS_POSITION_DEG = 180.0
+MAX_ABS_POSITION_DEG = 150.0
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOGGER = logging.getLogger("fft_gyro_controller")
 
 
 @dataclass
@@ -53,35 +59,70 @@ class AxisState:
 class FFTGyroProtocol:
     """Packet encoder for 32-byte FFT Gyro write packets.
 
-    Current defaults (editable in this class):
-    - Byte 0: 0xAA packet marker
-    - Byte 1: mode (0x03 write packet type-2)
-    - Byte 2: command (0x10 set position)
-    - Byte 3: axis mask bit0=X bit1=Y bit2=Z
-    - Byte 4..15: 3x float32 little-endian positions in degrees (X,Y,Z)
-    - Byte 30: packet counter
-    - Byte 31: checksum (sum of bytes[0:31] & 0xFF)
+    Packet format extracted from communication_protocol.pdf:
+    - Byte 0: start byte 0x7A
+    - Byte 1: packet number (0x01, 0x02, or 0x03)
+    - Byte 31: final byte 0x7B
     """
 
     PACKET_SIZE = 32
-    MODE_WRITE_TYPE2 = 0x03
-    CMD_SET_POSITION = 0x10
+    START_BYTE = 0x7A
+    END_BYTE = 0x7B
+    PACKET_WRITE_1 = 0x01
+    PACKET_WRITE_2 = 0x02
+    PACKET_WRITE_3 = 0x03
+    POSITION_CENTER = 512
+    DEG_PER_POSITION = 300.0 / 1023.0
 
-    def __init__(self) -> None:
-        self._counter = 0
+    @classmethod
+    def _deg_to_position(cls, degrees: float) -> int:
+        motor_degrees = degrees + 150.0
+        pos = int(round(motor_degrees / cls.DEG_PER_POSITION))
+        return max(0, min(1023, pos))
+
+    @staticmethod
+    def _set_u16_le(pkt: bytearray, offset: int, value: int) -> None:
+        pkt[offset] = value & 0xFF
+        pkt[offset + 1] = (value >> 8) & 0xFF
+
+    def _new_packet(self, packet_number: int) -> bytearray:
+        pkt = bytearray(self.PACKET_SIZE)
+        pkt[0] = self.START_BYTE
+        pkt[1] = packet_number
+        pkt[31] = self.END_BYTE
+        return pkt
+
+    def build_init_packet_set_joint_and_enable(self, axis_mask: int = 0b111) -> bytes:
+        pkt = self._new_packet(self.PACKET_WRITE_3)
+        # bytes 2..4: set mode flags ('1' => apply mode byte for that motor)
+        pkt[2] = ord("1") if (axis_mask & 0b001) else ord("0")
+        pkt[3] = ord("1") if (axis_mask & 0b010) else ord("0")
+        pkt[4] = ord("1") if (axis_mask & 0b100) else ord("0")
+        # bytes 5..7: motor mode ('2' => joint mode)
+        pkt[5] = ord("2")
+        pkt[6] = ord("2")
+        pkt[7] = ord("2")
+        # bytes 14..16: turn on motors ('1' => on)
+        pkt[14] = ord("1") if (axis_mask & 0b001) else ord("0")
+        pkt[15] = ord("1") if (axis_mask & 0b010) else ord("0")
+        pkt[16] = ord("1") if (axis_mask & 0b100) else ord("0")
+        # byte 30: data mode packet (0x02 => extended packet)
+        pkt[30] = 0x02
+        return bytes(pkt)
+
+    def build_init_packet_enable_torque(self, axis_mask: int = 0b111) -> bytes:
+        pkt = self._new_packet(self.PACKET_WRITE_1)
+        # byte 4: set torque enable bitfield (bit0=M1, bit1=M2, bit2=M3)
+        pkt[4] = axis_mask & 0x07
+        return bytes(pkt)
 
     def build_set_position(self, x_deg: float, y_deg: float, z_deg: float, axis_mask: int = 0b111) -> bytes:
-        pkt = bytearray(self.PACKET_SIZE)
-        pkt[0] = 0xAA
-        pkt[1] = self.MODE_WRITE_TYPE2
-        pkt[2] = self.CMD_SET_POSITION
-        pkt[3] = axis_mask & 0x07
+        pkt = self._new_packet(self.PACKET_WRITE_2)
+        pkt[22] = axis_mask & 0x07
 
-        struct.pack_into("<fff", pkt, 4, float(x_deg), float(y_deg), float(z_deg))
-
-        self._counter = (self._counter + 1) & 0xFF
-        pkt[30] = self._counter
-        pkt[31] = sum(pkt[:-1]) & 0xFF
+        self._set_u16_le(pkt, 23, self._deg_to_position(x_deg))
+        self._set_u16_le(pkt, 25, self._deg_to_position(y_deg))
+        self._set_u16_le(pkt, 27, self._deg_to_position(z_deg))
         return bytes(pkt)
 
 
@@ -89,7 +130,7 @@ class SerialController:
     def __init__(self, protocol: FFTGyroProtocol) -> None:
         self.protocol = protocol
         self._ser = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     @property
     def connected(self) -> bool:
@@ -101,6 +142,7 @@ class SerialController:
 
         with self._lock:
             self.disconnect()
+            LOGGER.info("Connecting to %s @ %d", port, baud)
             self._ser = serial.Serial(
                 port=port,
                 baudrate=baud,
@@ -109,21 +151,40 @@ class SerialController:
                 stopbits=serial.STOPBITS_ONE,
                 timeout=0.1,
             )
+            LOGGER.info("Connected to %s @ %d", port, baud)
 
     def disconnect(self) -> None:
         with self._lock:
             if self._ser is not None:
                 try:
+                    LOGGER.info("Disconnecting serial port %s", self._ser.port)
                     self._ser.close()
                 finally:
                     self._ser = None
 
     def send_position(self, x_deg: float, y_deg: float, z_deg: float, axis_mask: int = 0b111) -> None:
         pkt = self.protocol.build_set_position(x_deg, y_deg, z_deg, axis_mask)
+        self.send_raw(pkt)
+        LOGGER.info(
+            "Sent position x=%.3f y=%.3f z=%.3f mask=0x%02X packet=%s",
+            x_deg,
+            y_deg,
+            z_deg,
+            axis_mask,
+            pkt.hex(),
+        )
+
+    def initialize_motors(self, axis_mask: int = 0b111) -> None:
+        self.send_raw(self.protocol.build_init_packet_set_joint_and_enable(axis_mask))
+        self.send_raw(self.protocol.build_init_packet_enable_torque(axis_mask))
+        LOGGER.info("Sent motor initialization packets for mask=0x%02X", axis_mask)
+
+    def send_raw(self, pkt: bytes) -> None:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
             self._ser.write(pkt)
+            LOGGER.info("Sent raw packet=%s", pkt.hex())
 
 
 class AxisFrame(ttk.LabelFrame):
@@ -268,6 +329,10 @@ class App(tk.Tk):
     def _set_status(self, text: str, ok: bool = False) -> None:
         self.status_var.set(text)
         self.status_label.configure(foreground="#0a4" if ok else "#a00")
+        if ok:
+            LOGGER.info(text)
+        else:
+            LOGGER.warning(text)
 
     def _update_ui_state(self) -> None:
         connected = self.serial.connected
@@ -313,6 +378,7 @@ class App(tk.Tk):
                 raise ValueError("Baud must be a positive integer")
 
             self.serial.connect(port, baud)
+            self.serial.initialize_motors(0b111)
             self._set_status(f"Connected: {port} @ {baud}", ok=True)
             self._update_ui_state()
         except Exception as exc:
