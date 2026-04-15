@@ -92,20 +92,23 @@ class FFTGyroProtocol:
         pkt[31] = self.END_BYTE
         return pkt
 
-    def build_init_packet_set_joint_and_enable(self, axis_mask: int = 0b111) -> bytes:
+    def build_init_packet_set_joint_and_enable(self, axis_mask: int = 0b111, *, use_ascii_fields: bool = True) -> bytes:
         pkt = self._new_packet(self.PACKET_WRITE_3)
+        one = ord("1") if use_ascii_fields else 0x01
+        zero = ord("0") if use_ascii_fields else 0x00
+        joint = ord("2") if use_ascii_fields else 0x02
         # bytes 2..4: set mode flags ('1' => apply mode byte for that motor)
-        pkt[2] = ord("1") if (axis_mask & 0b001) else ord("0")
-        pkt[3] = ord("1") if (axis_mask & 0b010) else ord("0")
-        pkt[4] = ord("1") if (axis_mask & 0b100) else ord("0")
+        pkt[2] = one if (axis_mask & 0b001) else zero
+        pkt[3] = one if (axis_mask & 0b010) else zero
+        pkt[4] = one if (axis_mask & 0b100) else zero
         # bytes 5..7: motor mode ('2' => joint mode)
-        pkt[5] = ord("2")
-        pkt[6] = ord("2")
-        pkt[7] = ord("2")
+        pkt[5] = joint
+        pkt[6] = joint
+        pkt[7] = joint
         # bytes 14..16: turn on motors ('1' => on)
-        pkt[14] = ord("1") if (axis_mask & 0b001) else ord("0")
-        pkt[15] = ord("1") if (axis_mask & 0b010) else ord("0")
-        pkt[16] = ord("1") if (axis_mask & 0b100) else ord("0")
+        pkt[14] = one if (axis_mask & 0b001) else zero
+        pkt[15] = one if (axis_mask & 0b010) else zero
+        pkt[16] = one if (axis_mask & 0b100) else zero
         # byte 30: data mode packet (0x02 => extended packet)
         pkt[30] = 0x02
         return bytes(pkt)
@@ -125,11 +128,11 @@ class FFTGyroProtocol:
         self._set_u16_le(pkt, 27, self._deg_to_position(z_deg))
         return bytes(pkt)
 
-    def build_read_packet(self, packet_number: int) -> bytes:
+    def build_read_packet(self, packet_number: int, mode_byte: int = 0x01) -> bytes:
         pkt = self._new_packet(packet_number)
-        # byte 30 is documented as data mode in this protocol.
-        # 0x02 is used for extended write packets; 0x01 is used here for read requests.
-        pkt[30] = 0x01
+        # byte 30 is protocol-version dependent across FFT Gyro firmware variants.
+        # 0x01 is most common for read requests; some firmware expects 0x00/0x02.
+        pkt[30] = mode_byte & 0xFF
         return bytes(pkt)
 
     @classmethod
@@ -207,8 +210,16 @@ class SerialController:
         )
 
     def initialize_motors(self, axis_mask: int = 0b111) -> None:
-        self.send_raw(self.protocol.build_init_packet_set_joint_and_enable(axis_mask))
+        # Some firmware revisions expect ASCII-coded mode fields ("1"/"2"),
+        # while others expect raw numeric bytes (0x01/0x02). Send both forms.
+        self.send_raw(self.protocol.build_init_packet_set_joint_and_enable(axis_mask, use_ascii_fields=True))
+        time.sleep(0.03)
+        self.send_raw(self.protocol.build_init_packet_set_joint_and_enable(axis_mask, use_ascii_fields=False))
+        time.sleep(0.03)
         self.send_raw(self.protocol.build_init_packet_enable_torque(axis_mask))
+        time.sleep(0.03)
+        # Send center position once so enabled motors receive a valid motion packet.
+        self.send_position(0.0, 0.0, 0.0, axis_mask=axis_mask)
         LOGGER.info("Sent motor initialization packets for mask=0x%02X", axis_mask)
 
     def send_raw(self, pkt: bytes) -> None:
@@ -218,8 +229,32 @@ class SerialController:
             self._ser.write(pkt)
             LOGGER.info("Sent raw packet=%s", pkt.hex())
 
-    def query_packet(self, packet_number: int, timeout_s: float = 0.35) -> bytes:
-        req = self.protocol.build_read_packet(packet_number)
+    def _read_framed_packet(self, timeout_s: float) -> bytes:
+        deadline = time.monotonic() + timeout_s
+        buf = bytearray()
+        while time.monotonic() < deadline:
+            chunk = self._ser.read(1)
+            if not chunk:
+                continue
+            b = chunk[0]
+            if not buf:
+                if b != self.protocol.START_BYTE:
+                    continue
+                buf.append(b)
+                continue
+            buf.append(b)
+            if len(buf) == self.protocol.PACKET_SIZE:
+                if buf[-1] == self.protocol.END_BYTE:
+                    return bytes(buf)
+                # Resync on the last observed START byte.
+                try:
+                    start_idx = buf.index(self.protocol.START_BYTE, 1)
+                    buf = bytearray(buf[start_idx:])
+                except ValueError:
+                    buf.clear()
+        return bytes(buf)
+
+    def query_packet(self, packet_number: int, timeout_s: float = 0.45) -> bytes:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
@@ -227,16 +262,26 @@ class SerialController:
             old_timeout = self._ser.timeout
             self._ser.timeout = timeout_s
             try:
-                self._ser.reset_input_buffer()
-                self._ser.write(req)
-                reply = self._ser.read(self.protocol.PACKET_SIZE)
+                reply = b""
+                for mode_byte in (0x01, 0x00, 0x02):
+                    req = self.protocol.build_read_packet(packet_number, mode_byte=mode_byte)
+                    self._ser.reset_input_buffer()
+                    self._ser.write(req)
+                    candidate = self._read_framed_packet(timeout_s)
+                    if (
+                        len(candidate) == self.protocol.PACKET_SIZE
+                        and candidate[0] == self.protocol.START_BYTE
+                        and candidate[-1] == self.protocol.END_BYTE
+                    ):
+                        reply = candidate
+                        break
+                    reply = candidate
             finally:
                 self._ser.timeout = old_timeout
 
         LOGGER.info(
-            "Read request packet_number=0x%02X request=%s response=%s (len=%d)",
+            "Read request packet_number=0x%02X response=%s (len=%d)",
             packet_number,
-            req.hex(),
             reply.hex(),
             len(reply),
         )
