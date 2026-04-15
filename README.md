@@ -20,8 +20,6 @@ python3 motor_gui.py
 
 This app requires `pyserial`.
 
-The app uses a Tkinter desktop UI when available. On Python builds without Tk (for example some Homebrew Python installs), it automatically falls back to a local browser UI at `http://127.0.0.1:8765`.
-
 ```bash
 pip install pyserial
 ```
