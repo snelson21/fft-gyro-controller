@@ -219,7 +219,14 @@ class SerialController:
             raise RuntimeError("pyserial is not installed. Install with: pip install pyserial")
         with self._lock:
             self.disconnect()
-            self._ser = serial.Serial(port=port, baudrate=baud, timeout=0.1)
+            self._ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                timeout=0.1,
+                write_timeout=0.25,
+                inter_byte_timeout=0.1,
+            )
+            LOGGER.info("Opened serial port %s @ %d", port, baud)
 
     def disconnect(self) -> None:
         with self._lock:
@@ -233,7 +240,9 @@ class SerialController:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
-            self._ser.write(pkt)
+            wrote = self._ser.write(pkt)
+            if wrote != len(pkt):
+                raise RuntimeError(f"Short serial write: expected {len(pkt)} bytes, wrote {wrote}")
 
     def initialize_for_joint_position_mode(self, axis_mask: int = 0b111) -> None:
         self.send_raw(self.protocol.build_config_joint_mode(axis_mask=axis_mask))
@@ -351,6 +360,7 @@ class App(tk.Tk):
 
         self.axis_frames: dict[str, AxisFrame] = {}
         self._build_ui()
+        self.report_callback_exception = self._report_tk_exception
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self, padding=8)
@@ -402,6 +412,10 @@ class App(tk.Tk):
     def _status(self, text: str, ok: bool = True) -> None:
         self.status_var.set(text)
         LOGGER.info(text) if ok else LOGGER.warning(text)
+
+    def _report_tk_exception(self, exc: type[BaseException], val: BaseException, tb: object) -> None:
+        LOGGER.exception("Unhandled Tk callback exception", exc_info=(exc, val, tb))
+        messagebox.showerror("Application error", f"Unhandled exception: {val}")
 
     def _update_ui_state(self) -> None:
         connected = self.serial.connected
@@ -503,27 +517,28 @@ class App(tk.Tk):
         if not self._running:
             return
 
-        t = time.monotonic() - self._start_t
-        cmds = [self._axis_values(a) for a in AXES]
+        try:
+            t = time.monotonic() - self._start_t
+            cmds = [self._axis_values(a) for a in AXES]
 
-        vals = []
-        mask = 0
-        for i, cmd in enumerate(cmds):
-            if cmd.enabled:
-                # Run sine motion around the configured target position.
-                v = cmd.target_deg + cmd.amplitude_deg * math.sin(2 * math.pi * cmd.frequency_hz * t)
-                mask |= (1 << i)
-            else:
-                v = cmd.target_deg
-            vals.append(max(0.0, min(DEFAULT_MAX_ANGLE_DEG, v)))
+            vals = []
+            mask = 0
+            for i, cmd in enumerate(cmds):
+                if cmd.enabled:
+                    # Run sine motion around the configured target position.
+                    v = cmd.target_deg + cmd.amplitude_deg * math.sin(2 * math.pi * cmd.frequency_hz * t)
+                    mask |= (1 << i)
+                else:
+                    v = cmd.target_deg
+                vals.append(max(0.0, min(DEFAULT_MAX_ANGLE_DEG, v)))
 
-        if mask:
-            try:
+            if mask:
                 self.serial.send_position(vals[0], vals[1], vals[2], axis_mask=mask, velocity_raw=self._velocity_raw())
-            except Exception as exc:
-                self._running = False
-                messagebox.showerror("Serial error", str(exc))
-                return
+        except Exception as exc:
+            self._running = False
+            LOGGER.exception("Sine loop failed")
+            messagebox.showerror("Sine loop stopped", str(exc))
+            return
 
         self.after(int(self.UPDATE_PERIOD_S * 1000), self._tick)
 
