@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover
 AXES = ("X", "Y", "Z")
 DEFAULT_BAUD = 9600
 COMMON_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
+DEFAULT_DEVICE_SETTLE_S = 0.12
 
 DEFAULT_MAX_ANGLE_DEG = 360.0
 DEFAULT_MOTOR_RES_DEG = 0.088  # MX-series used by official tool
@@ -223,6 +224,9 @@ class SerialController:
             self._ser = serial.Serial(
                 port=port,
                 baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
                 timeout=0.1,
                 write_timeout=0.25,
                 inter_byte_timeout=0.1,
@@ -241,8 +245,13 @@ class SerialController:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
+            min_gap_s = self.min_command_interval_s(packet_bytes=len(pkt))
+            elapsed = time.monotonic() - self._last_send_t
+            if elapsed < min_gap_s:
+                time.sleep(min_gap_s - elapsed)
             try:
                 wrote = self._ser.write(pkt)
+                self._ser.flush()
             except serial.SerialTimeoutException as exc:
                 # The device stopped draining TX; clear pending bytes so the UI thread
                 # can recover quickly instead of stalling on repeated timeouts.
@@ -262,7 +271,7 @@ class SerialController:
                 return 0.0
             # UART usually transmits 10 bits per payload byte (start + 8 data + stop).
             tx_time_s = (packet_bytes * 10) / float(self._ser.baudrate)
-            return tx_time_s * 1.25
+            return max(tx_time_s * 1.25, DEFAULT_DEVICE_SETTLE_S)
 
     def initialize_for_joint_position_mode(self, axis_mask: int = 0b111) -> None:
         self.send_raw(self.protocol.build_config_joint_mode(axis_mask=axis_mask))
