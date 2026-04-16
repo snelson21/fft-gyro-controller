@@ -6,6 +6,7 @@ GUI controller for FFT Gyro motors.
 
 - Control **X, Y, Z** axes independently in **joint mode**.
 - Configure **sine amplitude** and **frequency** per axis.
+- Sine frequency is automatically validated against command update rate to avoid visibly jerky motion from undersampling.
 - Send immediate per-axis or all-axis position targets.
 - Configure command speed field (`0..1023`) for packet #2 writes.
 - Read and decode motor feedback using the official packet field layout.
