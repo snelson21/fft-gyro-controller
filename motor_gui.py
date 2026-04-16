@@ -209,6 +209,7 @@ class SerialController:
         self.protocol = protocol
         self._ser = None
         self._lock = threading.RLock()
+        self._last_send_t = 0.0
 
     @property
     def connected(self) -> bool:
@@ -243,6 +244,16 @@ class SerialController:
             wrote = self._ser.write(pkt)
             if wrote != len(pkt):
                 raise RuntimeError(f"Short serial write: expected {len(pkt)} bytes, wrote {wrote}")
+            self._last_send_t = time.monotonic()
+
+    def min_command_interval_s(self, packet_bytes: int = FFTGyroProtocol.PACKET_SIZE) -> float:
+        """Minimum practical interval between writes for current baud (with safety margin)."""
+        with self._lock:
+            if not self.connected:
+                return 0.0
+            # UART usually transmits 10 bits per payload byte (start + 8 data + stop).
+            tx_time_s = (packet_bytes * 10) / float(self._ser.baudrate)
+            return tx_time_s * 1.25
 
     def initialize_for_joint_position_mode(self, axis_mask: int = 0b111) -> None:
         self.send_raw(self.protocol.build_config_joint_mode(axis_mask=axis_mask))
@@ -351,6 +362,7 @@ class App(tk.Tk):
 
         self._running = False
         self._start_t = 0.0
+        self._next_send_due_t = 0.0
         self._ports_cache: dict[str, object] = {}
 
         self.port_var = tk.StringVar(value="")
@@ -508,6 +520,7 @@ class App(tk.Tk):
 
         self._running = True
         self._start_t = time.monotonic()
+        self._next_send_due_t = self._start_t
         self._tick()
 
     def stop_sine(self) -> None:
@@ -518,6 +531,11 @@ class App(tk.Tk):
             return
 
         try:
+            now = time.monotonic()
+            if now < self._next_send_due_t:
+                self.after(int(self.UPDATE_PERIOD_S * 1000), self._tick)
+                return
+
             t = time.monotonic() - self._start_t
             cmds = [self._axis_values(a) for a in AXES]
 
@@ -534,6 +552,10 @@ class App(tk.Tk):
 
             if mask:
                 self.serial.send_position(vals[0], vals[1], vals[2], axis_mask=mask, velocity_raw=self._velocity_raw())
+                min_interval = self.serial.min_command_interval_s()
+                self._next_send_due_t = time.monotonic() + max(self.UPDATE_PERIOD_S, min_interval)
+            else:
+                self._next_send_due_t = time.monotonic() + self.UPDATE_PERIOD_S
         except Exception as exc:
             self._running = False
             LOGGER.exception("Sine loop failed")
