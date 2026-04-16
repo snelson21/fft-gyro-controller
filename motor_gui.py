@@ -25,13 +25,14 @@ except Exception:  # pragma: no cover
 AXES = ("X", "Y", "Z")
 DEFAULT_BAUD = 9600
 COMMON_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
-DEFAULT_DEVICE_SETTLE_S = 0.12
+DEFAULT_DEVICE_SETTLE_S = 0.02
 
 DEFAULT_MAX_ANGLE_DEG = 360.0
 DEFAULT_MOTOR_RES_DEG = 0.088  # MX-series used by official tool
 DEFAULT_RAW_MAX = 4095
 
 MAX_FREQUENCY_HZ = 20.0
+MIN_SINE_SAMPLES_PER_CYCLE = 20
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("fft_gyro_controller")
@@ -482,6 +483,14 @@ class App(tk.Tk):
             raise ValueError("Speed raw must be in 0..1023")
         return v
 
+    def _max_sine_frequency_hz(self) -> float:
+        """Upper bound that keeps enough trajectory points per sine cycle."""
+        interval_s = max(self.UPDATE_PERIOD_S, self.serial.min_command_interval_s())
+        if interval_s <= 0:
+            return MAX_FREQUENCY_HZ
+        max_by_sampling = 1.0 / (interval_s * MIN_SINE_SAMPLES_PER_CYCLE)
+        return min(MAX_FREQUENCY_HZ, max_by_sampling)
+
     def connect_serial(self) -> None:
         try:
             port = self.port_var.get().strip()
@@ -529,9 +538,15 @@ class App(tk.Tk):
             messagebox.showwarning("Not connected", "Connect first")
             return
         try:
-            for ax in AXES:
-                self._axis_values(ax)
+            cmds = {ax: self._axis_values(ax) for ax in AXES}
             self._velocity_raw()
+            safe_max_hz = self._max_sine_frequency_hz()
+            for ax, cmd in cmds.items():
+                if cmd.enabled and cmd.frequency_hz > safe_max_hz:
+                    raise ValueError(
+                        f"{ax}: frequency {cmd.frequency_hz:.2f} Hz is too high for the current command rate. "
+                        f"Use <= {safe_max_hz:.2f} Hz or raise baud/lower update interval."
+                    )
         except Exception as exc:
             messagebox.showerror("Input error", str(exc))
             return
