@@ -241,7 +241,16 @@ class SerialController:
         with self._lock:
             if not self.connected:
                 raise RuntimeError("Serial port is not connected")
-            wrote = self._ser.write(pkt)
+            try:
+                wrote = self._ser.write(pkt)
+            except serial.SerialTimeoutException as exc:
+                # The device stopped draining TX; clear pending bytes so the UI thread
+                # can recover quickly instead of stalling on repeated timeouts.
+                try:
+                    self._ser.reset_output_buffer()
+                except Exception:
+                    LOGGER.exception("Failed to reset serial output buffer after timeout")
+                raise TimeoutError("Serial write timeout. Check controller power/cable and reconnect.") from exc
             if wrote != len(pkt):
                 raise RuntimeError(f"Short serial write: expected {len(pkt)} bytes, wrote {wrote}")
             self._last_send_t = time.monotonic()
@@ -556,6 +565,13 @@ class App(tk.Tk):
                 self._next_send_due_t = time.monotonic() + max(self.UPDATE_PERIOD_S, min_interval)
             else:
                 self._next_send_due_t = time.monotonic() + self.UPDATE_PERIOD_S
+        except TimeoutError as exc:
+            self._running = False
+            self._status(str(exc), ok=False)
+            self.serial.disconnect()
+            self._update_ui_state()
+            messagebox.showwarning("Sine loop stopped", str(exc))
+            return
         except Exception as exc:
             self._running = False
             LOGGER.exception("Sine loop failed")
