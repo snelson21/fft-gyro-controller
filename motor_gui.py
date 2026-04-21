@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover
 
 AXES = ("X", "Y", "Z")
 DEFAULT_BAUD = 9600
-COMMON_BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
+COMMON_BAUDS = (9600,)
 DEFAULT_DEVICE_SETTLE_S = 0.02
 
 DEFAULT_MAX_ANGLE_DEG = 360.0
@@ -274,13 +274,14 @@ class SerialController:
             tx_time_s = (packet_bytes * 10) / float(self._ser.baudrate)
             return max(tx_time_s * 1.25, DEFAULT_DEVICE_SETTLE_S)
 
-    def initialize_for_joint_position_mode(self, axis_mask: int = 0b111) -> None:
+    def initialize_for_joint_position_mode(self, axis_mask: int = 0b111, data_rate_units_10ms: int = 10) -> None:
         self.send_raw(self.protocol.build_config_joint_mode(axis_mask=axis_mask))
         time.sleep(0.2)
         self.send_raw(
             self.protocol.build_write1(
                 axis_mask=axis_mask,
-                set_data_rate=False,
+                set_data_rate=True,
+                data_rate_units_10ms=max(1, min(255, data_rate_units_10ms)),
                 set_torque_limit=True,
                 torque_limit_raw=1023,
                 set_max_torque=True,
@@ -387,6 +388,7 @@ class App(tk.Tk):
         self.port_var = tk.StringVar(value="")
         self.baud_var = tk.StringVar(value=str(DEFAULT_BAUD))
         self.speed_raw_var = tk.IntVar(value=90)
+        self.data_rate_units_var = tk.IntVar(value=10)
         self.status_var = tk.StringVar(value="Disconnected")
 
         self.axis_frames: dict[str, AxisFrame] = {}
@@ -402,19 +404,28 @@ class App(tk.Tk):
         self.port_combo.grid(row=0, column=1, sticky="w", padx=(4, 12))
         ttk.Button(top, text="Refresh", command=self.refresh_ports).grid(row=0, column=2, padx=(0, 12))
 
-        ttk.Label(top, text="Baud").grid(row=0, column=3, sticky="w")
-        self.baud_combo = ttk.Combobox(top, textvariable=self.baud_var, width=10, values=[str(v) for v in COMMON_BAUDS])
+        ttk.Label(top, text="Baud (fixed)").grid(row=0, column=3, sticky="w")
+        self.baud_combo = ttk.Combobox(
+            top,
+            textvariable=self.baud_var,
+            width=10,
+            values=[str(v) for v in COMMON_BAUDS],
+            state="readonly",
+        )
         self.baud_combo.grid(row=0, column=4, sticky="w", padx=(4, 12))
 
         ttk.Label(top, text="Speed raw (0-1023)").grid(row=0, column=5, sticky="w")
         ttk.Entry(top, textvariable=self.speed_raw_var, width=8).grid(row=0, column=6, sticky="w", padx=(4, 12))
 
-        self.connect_btn = ttk.Button(top, text="Connect + Init", command=self.connect_serial)
-        self.connect_btn.grid(row=0, column=7, padx=4)
-        self.disconnect_btn = ttk.Button(top, text="Disconnect", command=self.disconnect_serial)
-        self.disconnect_btn.grid(row=0, column=8, padx=4)
+        ttk.Label(top, text="Data rate (x10 ms)").grid(row=0, column=7, sticky="w")
+        ttk.Entry(top, textvariable=self.data_rate_units_var, width=8).grid(row=0, column=8, sticky="w", padx=(4, 12))
 
-        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=9, sticky="w", padx=(10, 0))
+        self.connect_btn = ttk.Button(top, text="Connect + Init", command=self.connect_serial)
+        self.connect_btn.grid(row=0, column=9, padx=4)
+        self.disconnect_btn = ttk.Button(top, text="Disconnect", command=self.disconnect_serial)
+        self.disconnect_btn.grid(row=0, column=10, padx=4)
+
+        ttk.Label(top, textvariable=self.status_var).grid(row=0, column=11, sticky="w", padx=(10, 0))
 
         body = ttk.Frame(self, padding=8)
         body.pack(fill="both", expand=True)
@@ -483,6 +494,12 @@ class App(tk.Tk):
             raise ValueError("Speed raw must be in 0..1023")
         return v
 
+    def _data_rate_units_10ms(self) -> int:
+        units = int(self.data_rate_units_var.get())
+        if units < 1 or units > 255:
+            raise ValueError("Data rate must be in 1..255 (10 ms units)")
+        return units
+
     def _max_sine_frequency_hz(self) -> float:
         """Upper bound that keeps enough trajectory points per sine cycle."""
         interval_s = max(self.UPDATE_PERIOD_S, self.serial.min_command_interval_s())
@@ -496,11 +513,16 @@ class App(tk.Tk):
             port = self.port_var.get().strip()
             if not port:
                 raise ValueError("Select a serial port")
-            baud = int(self.baud_var.get())
+            baud = DEFAULT_BAUD
+            self.baud_var.set(str(DEFAULT_BAUD))
             self.serial.connect(port, baud)
-            self.serial.initialize_for_joint_position_mode(0b111)
+            data_rate_units = self._data_rate_units_10ms()
+            self.serial.initialize_for_joint_position_mode(0b111, data_rate_units_10ms=data_rate_units)
             self.serial.send_position(180.0, 180.0, 180.0, axis_mask=0b111, velocity_raw=self._velocity_raw())
-            self._status(f"Connected and initialized: {port} @ {baud}", ok=True)
+            self._status(
+                f"Connected and initialized: {port} @ {baud} (data rate {data_rate_units * 10} ms)",
+                ok=True,
+            )
             self._update_ui_state()
         except Exception as exc:
             messagebox.showerror("Connection error", str(exc))
@@ -540,6 +562,7 @@ class App(tk.Tk):
         try:
             cmds = {ax: self._axis_values(ax) for ax in AXES}
             self._velocity_raw()
+            self._data_rate_units_10ms()
             safe_max_hz = self._max_sine_frequency_hz()
             for ax, cmd in cmds.items():
                 if cmd.enabled and cmd.frequency_hz > safe_max_hz:

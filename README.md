@@ -9,6 +9,7 @@ GUI controller for FFT Gyro motors.
 - Sine frequency is automatically validated against command update rate to avoid visibly jerky motion from undersampling.
 - Send immediate per-axis or all-axis position targets.
 - Configure command speed field (`0..1023`) for packet #2 writes.
+- Configure telemetry data-rate setup (`1..255` units of 10 ms) during initialization to prevent serial saturation.
 - Read and decode motor feedback using the official packet field layout.
 
 ## Run
@@ -16,6 +17,13 @@ GUI controller for FFT Gyro motors.
 ```bash
 python3 motor_gui.py
 ```
+
+## Serial settings (per manual)
+
+- Baudrate: `9600`
+- Data bits: `8`
+- Parity: `None`
+- Stop bits: `1`
 
 ## Dependency
 
